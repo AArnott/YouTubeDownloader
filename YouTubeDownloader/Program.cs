@@ -22,9 +22,11 @@ SynchronizationContext.SetSynchronizationContext(new NonConcurrentSynchronizatio
 Command downloadCommand = new("download", "Downloads one or more YouTube videos.");
 Option<string> outputDirectoryOption = new(new[] { "-o", "--output" }, "The path to the directory that will contain the downloaded video(s).");
 downloadCommand.AddOption(outputDirectoryOption);
+Option<int> concurrentDownloadsOption = new(new[] { "-c", "--concurrent" }, () => 30, "The number of segments to split a video into for concurrent (faster!) download.");
+downloadCommand.AddOption(concurrentDownloadsOption);
 Argument<string[]> videosArgument = new("videoUrl", "The URL or ID of the YouTube video(s) to download.") { Arity = ArgumentArity.OneOrMore };
 downloadCommand.AddArgument(videosArgument);
-downloadCommand.SetHandler((videosArg, outputDirOption) => DownloadAsync(videosArg, outputDirOption, cts.Token), videosArgument, outputDirectoryOption);
+downloadCommand.SetHandler((videosArg, outputDirOption, segmentCount) => DownloadAsync(videosArg, outputDirOption, segmentCount, cts.Token), videosArgument, outputDirectoryOption, concurrentDownloadsOption);
 
 RootCommand rootCommand = new();
 rootCommand.AddCommand(downloadCommand);
@@ -39,7 +41,7 @@ catch (Exception ex)
     return 1;
 }
 
-async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, CancellationToken cancellationToken)
+async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segmentCount, CancellationToken cancellationToken)
 {
     string[] videoUrls = new string[videoUrlsOrIds.Length];
     for (int i = 0; i < videoUrls.Length; i++)
@@ -73,6 +75,7 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, Cancellatio
         .Columns(
             new TaskDescriptionColumn(),
             new ProgressBarColumn(),
+            new DownloadedColumn(),
             new PercentageColumn(),
             new TransferSpeedColumn(),
             new RemainingTimeColumn(),
@@ -98,6 +101,7 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, Cancellatio
             string targetPath = Path.Combine(outputDir, videos[i].FullName);
             downloadTasks[i] = CreateDownloadAsync(
                 new Uri(video.Uri),
+                segmentCount,
                 targetPath,
                 new Progress<(long Copied, long Total)>(v =>
                 {
@@ -115,14 +119,13 @@ static async Task<YouTubeVideo?> PickBestVideoAsync(YouTube youtube, string vide
 {
     IEnumerable<YouTubeVideo> videos = await youtube.GetAllVideosAsync(videoUri);
     return (from video in videos
-            where video.Format == VideoFormat.WebM
+            where video.Format == VideoFormat.Mp4
             orderby video.Resolution descending
             select video).FirstOrDefault();
 }
 
-static async Task CreateDownloadAsync(Uri uri, string filePath, IProgress<(long Copied, long Total)> progress, CancellationToken cancellationToken)
+static async Task CreateDownloadAsync(Uri uri, int segmentCount, string filePath, IProgress<(long Copied, long Total)> progress, CancellationToken cancellationToken)
 {
-    const long ChunkSize = 10 * 1024 * 1024;
 
     using HttpClient httpClient = new();
 
@@ -145,7 +148,7 @@ static async Task CreateDownloadAsync(Uri uri, string filePath, IProgress<(long 
         }
     }
 
-    int segmentCount = (int)Math.Ceiling(1.0 * fileSize / ChunkSize);
+    long ChunkSize = (long)Math.Ceiling((double)fileSize / segmentCount);
     Task[] segmentDownloadTasks = new Task[segmentCount];
     for (int i = 0; i < segmentCount; i++)
     {
