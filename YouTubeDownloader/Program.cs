@@ -4,6 +4,7 @@ using System.Buffers;
 using System.CommandLine;
 using System.Globalization;
 using System.Net.Http.Headers;
+using System.Threading.Tasks.Dataflow;
 using VideoLibrary;
 
 // Add this to your C# console app's Main method to give yourself
@@ -75,6 +76,7 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, Cancellatio
             new PercentageColumn(),
             new TransferSpeedColumn(),
             new RemainingTimeColumn(),
+            new ElapsedTimeColumn(),
             new SpinnerColumn())
         .HideCompleted(false)
         .StartAsync(async ctx =>
@@ -97,10 +99,10 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, Cancellatio
             downloadTasks[i] = CreateDownloadAsync(
                 new Uri(video.Uri),
                 targetPath,
-                new Progress<Tuple<long, long>>((Tuple<long, long> v) =>
+                new Progress<(long Copied, long Total)>(v =>
                 {
-                    task.MaxValue = v.Item2;
-                    task.Value = v.Item1;
+                    task.Value = v.Copied;
+                    task.MaxValue = v.Total;
                 }),
                 cancellationToken);
         }
@@ -108,8 +110,6 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, Cancellatio
         await Task.WhenAll(downloadTasks);
     });
 }
-
-const long ChunkSize = 10 * 1024 * 1024;
 
 static async Task<YouTubeVideo?> PickBestVideoAsync(YouTube youtube, string videoUri, CancellationToken cancellationToken)
 {
@@ -120,25 +120,52 @@ static async Task<YouTubeVideo?> PickBestVideoAsync(YouTube youtube, string vide
             select video).FirstOrDefault();
 }
 
-static async Task CreateDownloadAsync(Uri uri, string filePath, IProgress<Tuple<long, long>> progress, CancellationToken cancellationToken)
+static async Task CreateDownloadAsync(Uri uri, string filePath, IProgress<(long Copied, long Total)> progress, CancellationToken cancellationToken)
 {
+    const long ChunkSize = 10 * 1024 * 1024;
+
     using HttpClient httpClient = new();
 
     long totalBytesCopied = 0L;
     long fileSize = await GetContentLengthAsync(httpClient, uri.AbsoluteUri) ?? throw new InvalidOperationException("Unable to determine total file size.");
 
     using FileStream output = new(filePath, FileMode.Create, FileAccess.Write, FileShare.Read, 4096, useAsync: true);
+    output.SetLength(fileSize);
+
+    AsyncSemaphore fileWriterContext = new(1);
+
+    async Task WriteBytesAsync(long position, ReadOnlyMemory<byte> buffer)
+    {
+        using (await fileWriterContext.EnterAsync(cancellationToken))
+        {
+            output.Position = position;
+            await output.WriteAsync(buffer, cancellationToken);
+            totalBytesCopied += buffer.Length;
+            progress.Report((totalBytesCopied, fileSize));
+        }
+    }
+
     int segmentCount = (int)Math.Ceiling(1.0 * fileSize / ChunkSize);
+    Task[] segmentDownloadTasks = new Task[segmentCount];
     for (int i = 0; i < segmentCount; i++)
     {
-        long from = i * ChunkSize;
-        long to = (i + 1) * ChunkSize - 1;
+        segmentDownloadTasks[i] = DownloadSegmentAsync(i);
+    }
+
+    await Task.WhenAll(segmentDownloadTasks);
+    AnsiConsole.MarkupLineInterpolated($"Completed download of [green]{filePath}[/]");
+
+    async Task DownloadSegmentAsync(int segment)
+    {
+        long from = segment * ChunkSize;
+        long to = (segment + 1) * ChunkSize - 1;
+        long position = from;
         using HttpRequestMessage request = new(HttpMethod.Get, uri);
         request.Headers.Range = new RangeHeaderValue(from, to);
 
-        HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        using HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
-        Stream stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using Stream stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         byte[] buffer = ArrayPool<byte>.Shared.Rent(81920);
         try
         {
@@ -146,9 +173,8 @@ static async Task CreateDownloadAsync(Uri uri, string filePath, IProgress<Tuple<
             do
             {
                 bytesCopied = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                output.Write(buffer, 0, bytesCopied);
-                totalBytesCopied += bytesCopied;
-                progress.Report(new Tuple<long, long>(totalBytesCopied, fileSize));
+                await WriteBytesAsync(position, buffer.AsMemory(0, bytesCopied));
+                position += bytesCopied;
             } while (bytesCopied > 0);
         }
         finally
