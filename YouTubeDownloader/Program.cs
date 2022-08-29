@@ -4,7 +4,6 @@ using System.Buffers;
 using System.CommandLine;
 using System.Globalization;
 using System.Net.Http.Headers;
-using System.Threading.Tasks.Dataflow;
 using VideoLibrary;
 
 // Add this to your C# console app's Main method to give yourself
@@ -59,7 +58,8 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
 
         for (int i = 0; i < videoUrls.Length; i++)
         {
-            YouTubeVideo? video = await PickBestVideoAsync(youtube, videoUrls[i], cancellationToken);
+            IEnumerable<YouTubeVideo> candidates = await youtube.GetAllVideosAsync(videoUrls[i]);
+            YouTubeVideo? video = PickBestVideo(candidates, cancellationToken);
             if (video is null)
             {
                 AnsiConsole.MarkupLineInterpolated($"[red]Error:[/] No compatible video found for {videoUrls[i]}.");
@@ -67,13 +67,13 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
             }
 
             videos[i] = video;
-            AnsiConsole.MarkupLineInterpolated($"{videoUrls[i]}: [yellow]{video.Resolution.ToString(CultureInfo.CurrentCulture)}p {video.Format}[/]");
+            AnsiConsole.MarkupLineInterpolated($"{videoUrls[i]}: [yellow]{video.Resolution.ToString(CultureInfo.CurrentCulture)}p {video.Format} {video.AudioBitrate} {video.AudioFormat}[/] [blue]{video.Title}[/]");
         }
     });
 
     await AnsiConsole.Progress()
         .Columns(
-            new TaskDescriptionColumn(),
+            new TaskDescriptionColumn() { Alignment = Justify.Left },
             new ProgressBarColumn(),
             new DownloadedColumn(),
             new PercentageColumn(),
@@ -115,75 +115,105 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
     });
 }
 
-static async Task<YouTubeVideo?> PickBestVideoAsync(YouTube youtube, string videoUri, CancellationToken cancellationToken)
+static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, CancellationToken cancellationToken)
 {
-    IEnumerable<YouTubeVideo> videos = await youtube.GetAllVideosAsync(videoUri);
     return (from video in videos
-            where video.Format == VideoFormat.Mp4
+            where video.Format != VideoFormat.Unknown && video.AudioBitrate > 0
             orderby video.Resolution descending
+            orderby video.AudioBitrate descending
             select video).FirstOrDefault();
 }
 
 static async Task CreateDownloadAsync(Uri uri, int segmentCount, string filePath, IProgress<(long Copied, long Total)> progress, CancellationToken cancellationToken)
 {
-
-    using HttpClient httpClient = new();
-
-    long totalBytesCopied = 0L;
-    long fileSize = await GetContentLengthAsync(httpClient, uri.AbsoluteUri) ?? throw new InvalidOperationException("Unable to determine total file size.");
-
-    using FileStream output = new(filePath, FileMode.Create, FileAccess.Write, FileShare.Read, 4096, useAsync: true);
-    output.SetLength(fileSize);
-
-    AsyncSemaphore fileWriterContext = new(1);
-
-    async Task WriteBytesAsync(long position, ReadOnlyMemory<byte> buffer)
+    try
     {
-        using (await fileWriterContext.EnterAsync(cancellationToken))
+        using HttpClient httpClient = new();
+
+        long totalBytesCopied = 0L;
+        long fileSize = await GetContentLengthAsync(httpClient, uri.AbsoluteUri) ?? throw new InvalidOperationException("Unable to determine total file size.");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(filePath) ?? throw new ArgumentException("Bad file path.", nameof(filePath)));
+        using FileStream output = new(filePath, FileMode.Create, FileAccess.Write, FileShare.Read, 4096, useAsync: true);
+        output.SetLength(fileSize);
+
+        AsyncSemaphore fileWriterContext = new(1);
+
+        async Task WriteBytesAsync(long position, ReadOnlyMemory<byte> buffer)
         {
-            output.Position = position;
-            await output.WriteAsync(buffer, cancellationToken);
-            totalBytesCopied += buffer.Length;
-            progress.Report((totalBytesCopied, fileSize));
-        }
-    }
-
-    long ChunkSize = (long)Math.Ceiling((double)fileSize / segmentCount);
-    Task[] segmentDownloadTasks = new Task[segmentCount];
-    for (int i = 0; i < segmentCount; i++)
-    {
-        segmentDownloadTasks[i] = DownloadSegmentAsync(i);
-    }
-
-    await Task.WhenAll(segmentDownloadTasks);
-    AnsiConsole.MarkupLineInterpolated($"Completed download of [green]{filePath}[/]");
-
-    async Task DownloadSegmentAsync(int segment)
-    {
-        long from = segment * ChunkSize;
-        long to = (segment + 1) * ChunkSize - 1;
-        long position = from;
-        using HttpRequestMessage request = new(HttpMethod.Get, uri);
-        request.Headers.Range = new RangeHeaderValue(from, to);
-
-        using HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-        response.EnsureSuccessStatusCode();
-        using Stream stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(81920);
-        try
-        {
-            int bytesCopied;
-            do
+            using (await fileWriterContext.EnterAsync(cancellationToken))
             {
-                bytesCopied = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                await WriteBytesAsync(position, buffer.AsMemory(0, bytesCopied));
-                position += bytesCopied;
-            } while (bytesCopied > 0);
+                output.Position = position;
+                await output.WriteAsync(buffer, cancellationToken);
+                totalBytesCopied += buffer.Length;
+                progress.Report((totalBytesCopied, fileSize));
+            }
         }
-        finally
+
+        long ChunkSize = (long)Math.Ceiling((double)fileSize / segmentCount);
+        Task[] segmentDownloadTasks = new Task[segmentCount];
+        for (int i = 0; i < segmentCount; i++)
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            segmentDownloadTasks[i] = DownloadSegmentAsync(i);
         }
+
+        await Task.WhenAll(segmentDownloadTasks);
+        AnsiConsole.MarkupLineInterpolated($"Completed download of [green]{filePath}[/]");
+
+        async Task DownloadSegmentAsync(int segment)
+        {
+            long from = segment * ChunkSize;
+            long to = (segment + 1) * ChunkSize - 1;
+            long position = from;
+
+            HttpResponseMessage? response = null;
+            try
+            {
+                while (true)
+                {
+                    using HttpRequestMessage request = new(HttpMethod.Get, uri);
+                    request.Headers.Range = new RangeHeaderValue(from, to);
+                    response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                    if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized)
+                    {
+                        AnsiConsole.MarkupLineInterpolated($"[red]YouTube is throttling {uri}. Pausing...[/] If this happens often, try reducing the concurrency level.");
+                        await Task.Delay(5000);
+                        response?.Dispose();
+                        continue;
+                    }
+
+                    response.EnsureSuccessStatusCode();
+                    break;
+                }
+
+                using Stream stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                byte[] buffer = ArrayPool<byte>.Shared.Rent(81920);
+                try
+                {
+                    int bytesCopied;
+                    do
+                    {
+                        bytesCopied = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                        await WriteBytesAsync(position, buffer.AsMemory(0, bytesCopied));
+                        position += bytesCopied;
+                    } while (bytesCopied > 0);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+            finally
+            {
+                response?.Dispose();
+            }
+        }
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        AnsiConsole.MarkupLineInterpolated($"[red]An error occurred[/] while downloading {Path.GetFileName(filePath)}.");
+        AnsiConsole.WriteException(ex);
+        throw;
     }
 }
 
