@@ -23,9 +23,16 @@ Option<string> outputDirectoryOption = new(new[] { "-o", "--output" }, "The path
 downloadCommand.AddOption(outputDirectoryOption);
 Option<int> concurrentDownloadsOption = new(new[] { "-c", "--concurrent" }, () => 30, "The number of segments to split a video into for concurrent (faster!) download.");
 downloadCommand.AddOption(concurrentDownloadsOption);
+Option<bool> audioOnly = new(new[] { "-a", "--audio-only" }, "Download only the audio track.");
+downloadCommand.AddOption(audioOnly);
 Argument<string[]> videosArgument = new("videoUrl", "The URL or ID of the YouTube video(s) to download.") { Arity = ArgumentArity.OneOrMore };
 downloadCommand.AddArgument(videosArgument);
-downloadCommand.SetHandler((videosArg, outputDirOption, segmentCount) => DownloadAsync(videosArg, outputDirOption, segmentCount, cts.Token), videosArgument, outputDirectoryOption, concurrentDownloadsOption);
+downloadCommand.SetHandler(
+    (videosArg, outputDirOption, segmentCount, audioOnly) => DownloadAsync(videosArg, outputDirOption, segmentCount, audioOnly, cts.Token),
+    videosArgument,
+    outputDirectoryOption,
+    concurrentDownloadsOption,
+    audioOnly);
 
 RootCommand rootCommand = new();
 rootCommand.AddCommand(downloadCommand);
@@ -40,7 +47,7 @@ catch (Exception ex)
     return 1;
 }
 
-async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segmentCount, CancellationToken cancellationToken)
+async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segmentCount, bool audioOnly, CancellationToken cancellationToken)
 {
     string[] videoUrls = new string[videoUrlsOrIds.Length];
     for (int i = 0; i < videoUrls.Length; i++)
@@ -59,7 +66,7 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
         for (int i = 0; i < videoUrls.Length; i++)
         {
             IEnumerable<YouTubeVideo> candidates = await youtube.GetAllVideosAsync(videoUrls[i]);
-            YouTubeVideo? video = PickBestVideo(candidates, cancellationToken);
+            YouTubeVideo? video = PickBestVideo(candidates, audioOnly, cancellationToken);
             if (video is null)
             {
                 AnsiConsole.MarkupLineInterpolated($"[red]Error:[/] No compatible video found for {videoUrls[i]}.");
@@ -99,6 +106,11 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
             Video video = videos[i];
             ProgressTask task = progressTasks[i];
             string targetPath = Path.Combine(outputDir, videos[i].FullName);
+            if (string.IsNullOrEmpty(videos[i].FileExtension) && audioOnly)
+            {
+                targetPath += $".{videos[i].AudioFormat.ToString()?.ToLowerInvariant()}";
+            }
+
             downloadTasks[i] = CreateDownloadAsync(
                 new Uri(video.Uri),
                 segmentCount,
@@ -115,13 +127,19 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
     });
 }
 
-static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, CancellationToken cancellationToken)
+static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, bool audioOnly, CancellationToken cancellationToken)
 {
-    return (from video in videos
-            where video.Format != VideoFormat.Unknown && video.AudioBitrate > 0
-            orderby video.Resolution descending
-            orderby video.AudioBitrate descending
-            select video).FirstOrDefault();
+    IOrderedEnumerable<YouTubeVideo> query = audioOnly
+        ? from video in videos
+          where video.AudioBitrate > 0 && video.Resolution == -1
+          orderby video.AudioBitrate descending
+          select video
+        : from video in videos
+          where video.Format != VideoFormat.Unknown && video.AudioBitrate > 0
+          orderby video.Resolution descending
+          orderby video.AudioBitrate descending
+          select video;
+    return query.FirstOrDefault();
 }
 
 static async Task CreateDownloadAsync(Uri uri, int segmentCount, string filePath, IProgress<(long Copied, long Total)> progress, CancellationToken cancellationToken)
