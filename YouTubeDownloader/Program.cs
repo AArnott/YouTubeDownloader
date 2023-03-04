@@ -136,8 +136,7 @@ static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, bool audioO
           select video
         : from video in videos
           where video.Format != VideoFormat.Unknown && video.AudioBitrate > 0
-          orderby video.Resolution descending
-          orderby video.AudioBitrate descending
+          orderby video.Resolution descending, video.AudioBitrate descending
           select video;
     return query.FirstOrDefault();
 }
