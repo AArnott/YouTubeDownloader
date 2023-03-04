@@ -25,14 +25,17 @@ Option<int> concurrentDownloadsOption = new(new[] { "-c", "--concurrent" }, () =
 downloadCommand.AddOption(concurrentDownloadsOption);
 Option<bool> audioOnly = new(new[] { "-a", "--audio-only" }, "Download only the audio track.");
 downloadCommand.AddOption(audioOnly);
+Option<bool> videoOnly = new(new[] { "-v", "--video-only" }, "Download the best video resolution, even if that file lacks an audio track.");
+downloadCommand.AddOption(videoOnly);
 Argument<string[]> videosArgument = new("videoUrl", "The URL or ID of the YouTube video(s) to download.") { Arity = ArgumentArity.OneOrMore };
 downloadCommand.AddArgument(videosArgument);
 downloadCommand.SetHandler(
-    (videosArg, outputDirOption, segmentCount, audioOnly) => DownloadAsync(videosArg, outputDirOption, segmentCount, audioOnly, cts.Token),
+    (videosArg, outputDirOption, segmentCount, audioOnly, videoOnly) => DownloadAsync(videosArg, outputDirOption, segmentCount, audioOnly, videoOnly, cts.Token),
     videosArgument,
     outputDirectoryOption,
     concurrentDownloadsOption,
-    audioOnly);
+    audioOnly,
+    videoOnly);
 
 RootCommand rootCommand = new();
 rootCommand.AddCommand(downloadCommand);
@@ -47,8 +50,13 @@ catch (Exception ex)
     return 1;
 }
 
-async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segmentCount, bool audioOnly, CancellationToken cancellationToken)
+async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segmentCount, bool audioOnly, bool videoOnly, CancellationToken cancellationToken)
 {
+    if (audioOnly && videoOnly)
+    {
+        throw new ArgumentException("Do not specify audio-only and video-only switches at the same time.");
+    }
+
     string[] videoUrls = new string[videoUrlsOrIds.Length];
     for (int i = 0; i < videoUrls.Length; i++)
     {
@@ -66,7 +74,7 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
         for (int i = 0; i < videoUrls.Length; i++)
         {
             IEnumerable<YouTubeVideo> candidates = await youtube.GetAllVideosAsync(videoUrls[i]);
-            YouTubeVideo? video = PickBestVideo(candidates, audioOnly, cancellationToken);
+            YouTubeVideo? video = PickBestVideo(candidates, audioOnly, videoOnly, cancellationToken);
             if (video is null)
             {
                 AnsiConsole.MarkupLineInterpolated($"[red]Error:[/] No compatible video found for {videoUrls[i]}.");
@@ -127,7 +135,7 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
     });
 }
 
-static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, bool audioOnly, CancellationToken cancellationToken)
+static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, bool audioOnly, bool videoOnly, CancellationToken cancellationToken)
 {
     IOrderedEnumerable<YouTubeVideo> query = audioOnly
         ? from video in videos
@@ -135,7 +143,7 @@ static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, bool audioO
           orderby video.AudioBitrate descending
           select video
         : from video in videos
-          where video.Format != VideoFormat.Unknown && video.AudioBitrate > 0
+          where video.Format != VideoFormat.Unknown && (video.AudioBitrate > 0 || videoOnly)
           orderby video.Resolution descending, video.AudioBitrate descending
           select video;
     return query.FirstOrDefault();
