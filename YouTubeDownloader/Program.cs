@@ -1,9 +1,9 @@
-﻿using Microsoft.VisualStudio.Threading;
-using Spectre.Console;
-using System.Buffers;
+﻿using System.Buffers;
 using System.CommandLine;
 using System.Globalization;
 using System.Net.Http.Headers;
+using Microsoft.VisualStudio.Threading;
+using Spectre.Console;
 using VideoLibrary;
 
 // Add this to your C# console app's Main method to give yourself
@@ -50,7 +50,7 @@ catch (Exception ex)
     return 1;
 }
 
-async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segmentCount, bool audioOnly, bool videoOnly, CancellationToken cancellationToken)
+async Task<int> DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segmentCount, bool audioOnly, bool videoOnly, CancellationToken cancellationToken)
 {
     if (audioOnly && videoOnly)
     {
@@ -66,7 +66,7 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
     YouTube youtube = YouTube.Default;
     YouTubeVideo[] videos = new YouTubeVideo[videoUrls.Length];
 
-    await AnsiConsole.Status()
+    int exitCode = await AnsiConsole.Status()
         .StartAsync("Preparing video download...", async ctx =>
     {
         ctx.Status("Downloading video metadata");
@@ -78,13 +78,16 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
             if (video is null)
             {
                 AnsiConsole.MarkupLineInterpolated($"[red]Error:[/] No compatible video found for {videoUrls[i]}.");
-                return;
+                return 1;
             }
 
             videos[i] = video;
             AnsiConsole.MarkupLineInterpolated($"{videoUrls[i]}: [yellow]{video.Resolution.ToString(CultureInfo.CurrentCulture)}p {video.Format} {video.AudioBitrate} {video.AudioFormat}[/] [blue]{video.Title}[/]");
         }
+
+        return 0;
     });
+    if (exitCode != 0) return exitCode;
 
     await AnsiConsole.Progress()
         .Columns(
@@ -133,6 +136,8 @@ async Task DownloadAsync(string[] videoUrlsOrIds, string? outputDir, int segment
 
         await Task.WhenAll(downloadTasks);
     });
+
+    return 0;
 }
 
 static YouTubeVideo? PickBestVideo(IEnumerable<YouTubeVideo> videos, bool audioOnly, bool videoOnly, CancellationToken cancellationToken)
