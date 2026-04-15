@@ -19,30 +19,51 @@ Console.CancelKeyPress += (s, e) =>
 SynchronizationContext.SetSynchronizationContext(new NonConcurrentSynchronizationContext(sticky: true));
 
 Command downloadCommand = new("download", "Downloads one or more YouTube videos.");
-Option<string> outputDirectoryOption = new(new[] { "-o", "--output" }, "The path to the directory that will contain the downloaded video(s).");
-downloadCommand.AddOption(outputDirectoryOption);
-Option<int> concurrentDownloadsOption = new(new[] { "-c", "--concurrent" }, () => 30, "The number of segments to split a video into for concurrent (faster!) download.");
-downloadCommand.AddOption(concurrentDownloadsOption);
-Option<bool> audioOnly = new(new[] { "-a", "--audio-only" }, "Download only the audio track.");
-downloadCommand.AddOption(audioOnly);
-Option<bool> videoOnly = new(new[] { "-v", "--video-only" }, "Download the best video resolution, even if that file lacks an audio track.");
-downloadCommand.AddOption(videoOnly);
-Argument<string[]> videosArgument = new("videoUrl", "The URL or ID of the YouTube video(s) to download.") { Arity = ArgumentArity.OneOrMore };
-downloadCommand.AddArgument(videosArgument);
-downloadCommand.SetHandler(
-    (videosArg, outputDirOption, segmentCount, audioOnly, videoOnly) => DownloadAsync(videosArg, outputDirOption, segmentCount, audioOnly, videoOnly, cts.Token),
-    videosArgument,
-    outputDirectoryOption,
-    concurrentDownloadsOption,
-    audioOnly,
-    videoOnly);
+Option<string> outputDirectoryOption = new("--output", "-o")
+{
+    Description = "The path to the directory that will contain the downloaded video(s)."
+};
+downloadCommand.Options.Add(outputDirectoryOption);
+Option<int> concurrentDownloadsOption = new("--concurrent", "-c")
+{
+    Description = "The number of segments to split a video into for concurrent (faster!) download.",
+    DefaultValueFactory = _ => 30
+};
+downloadCommand.Options.Add(concurrentDownloadsOption);
+Option<bool> audioOnly = new("--audio-only", "-a")
+{
+    Description = "Download only the audio track."
+};
+downloadCommand.Options.Add(audioOnly);
+Option<bool> videoOnly = new("--video-only", "-v")
+{
+    Description = "Download the best video resolution, even if that file lacks an audio track."
+};
+downloadCommand.Options.Add(videoOnly);
+Argument<string[]> videosArgument = new("videoUrl")
+{
+    Description = "The URL or ID of the YouTube video(s) to download.",
+    Arity = ArgumentArity.OneOrMore
+};
+downloadCommand.Arguments.Add(videosArgument);
+downloadCommand.SetAction((parseResult, cancellationToken) =>
+{
+    string[] videosArg = parseResult.GetValue(videosArgument) ?? [];
+    string? outputDirOption = parseResult.GetValue(outputDirectoryOption);
+    int segmentCount = parseResult.GetValue(concurrentDownloadsOption);
+    bool audioOnlyValue = parseResult.GetValue(audioOnly);
+    bool videoOnlyValue = parseResult.GetValue(videoOnly);
+
+    return DownloadAsync(videosArg, outputDirOption, segmentCount, audioOnlyValue, videoOnlyValue, cancellationToken);
+});
 
 RootCommand rootCommand = new();
-rootCommand.AddCommand(downloadCommand);
+rootCommand.Subcommands.Add(downloadCommand);
 
 try
 {
-    return await rootCommand.InvokeAsync(args);
+    ParseResult parseResult = rootCommand.Parse(args);
+    return await parseResult.InvokeAsync(new InvocationConfiguration(), cts.Token);
 }
 catch (Exception ex)
 {
